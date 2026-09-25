@@ -189,38 +189,22 @@ namespace SimHub.Plugin.Voicemeeter
 
         private void RebuildRows()
         {
+            _lastStripCount = RebuildRows(_strips, ChannelKind.Strip);
+            _lastBusCount = RebuildRows(_buses, ChannelKind.Bus);
+        }
+
+        private int RebuildRows(ObservableCollection<ChannelRowViewModel> rows, ChannelKind kind)
+        {
             var remote = _plugin.Remote;
-            int stripCount = remote.IsConnected ? remote.StripCount : 0;
-            int busCount = remote.IsConnected ? remote.BusCount : 0;
+            int count = remote.IsConnected ? remote.GetChannelCount(kind) : 0;
 
-            _strips.Clear();
-            for (int i = 0; i < stripCount; i++)
+            rows.Clear();
+            for (int i = 0; i < count; i++)
             {
-                int index = i;
-                _strips.Add(new ChannelRowViewModel(
-                    index,
-                    () => remote.GetStripGain(index),
-                    value => remote.SetStripGain(index, value),
-                    () => remote.GetStripMute(index),
-                    value => remote.SetStripMute(index, value),
-                    () => remote.GetStripLabel(index)));
+                rows.Add(new ChannelRowViewModel(remote, kind, i));
             }
 
-            _buses.Clear();
-            for (int i = 0; i < busCount; i++)
-            {
-                int index = i;
-                _buses.Add(new ChannelRowViewModel(
-                    index,
-                    () => remote.GetBusGain(index),
-                    value => remote.SetBusGain(index, value),
-                    () => remote.GetBusMute(index),
-                    value => remote.SetBusMute(index, value),
-                    () => remote.GetBusLabel(index)));
-            }
-
-            _lastStripCount = stripCount;
-            _lastBusCount = busCount;
+            return count;
         }
     }
 }

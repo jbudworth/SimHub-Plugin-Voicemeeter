@@ -1,52 +1,38 @@
-using System;
 using System.ComponentModel;
 
 namespace SimHub.Plugin.Voicemeeter
 {
     /// <summary>
     /// Live view of a single strip or bus channel, used to bind the settings-screen DataGrids
-    /// directly against the Voicemeeter Remote API without duplicating strip/bus logic.
+    /// directly against the Voicemeeter Remote API.
     /// </summary>
     public class ChannelRowViewModel : INotifyPropertyChanged
     {
-        private readonly Func<float> _getGain;
-        private readonly Action<float> _setGain;
-        private readonly Func<bool> _getMute;
-        private readonly Action<bool> _setMute;
-        private readonly Func<string> _getLabel;
+        private readonly VoicemeeterRemote _remote;
+        private readonly ChannelKind _kind;
+        private readonly int _index;
 
         public event PropertyChangedEventHandler PropertyChanged;
 
-        public ChannelRowViewModel(
-            int index,
-            Func<float> getGain,
-            Action<float> setGain,
-            Func<bool> getMute,
-            Action<bool> setMute,
-            Func<string> getLabel)
+        public ChannelRowViewModel(VoicemeeterRemote remote, ChannelKind kind, int index)
         {
-            Index = index;
-            _getGain = getGain;
-            _setGain = setGain;
-            _getMute = getMute;
-            _setMute = setMute;
-            _getLabel = getLabel;
+            _remote = remote;
+            _kind = kind;
+            _index = index;
         }
 
-        public int Index { get; }
-
-        public string Label => _getLabel();
+        public string Label => _remote.GetLabel(_kind, _index);
 
         public double Gain
         {
-            get => _getGain();
-            set => _setGain((float)value);
+            get => _remote.GetGain(_kind, _index);
+            set => _remote.SetGain(_kind, _index, (float)value);
         }
 
         public bool IsMuted
         {
-            get => _getMute();
-            set => _setMute(value);
+            get => _remote.GetMute(_kind, _index);
+            set => _remote.SetMute(_kind, _index, value);
         }
 
         /// <summary>

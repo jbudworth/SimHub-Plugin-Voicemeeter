@@ -22,6 +22,15 @@ namespace SimHub.Plugin.Voicemeeter
     {
         private const string DllName = "VoicemeeterRemote.dll";
 
+        /// <summary>
+        /// Return code shared by the VBVMR parameter functions meaning "no server" - the client
+        /// library lost the Voicemeeter process. This is the only result code that indicates a lost
+        /// connection; other negative codes (notably -3 "unknown parameter", e.g. asking a Basic
+        /// edition for Strip[6]) are per-call failures that say nothing about the connection and
+        /// must not tear it down.
+        /// </summary>
+        private const int ResultNoServer = -2;
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr LoadLibrary(string lpFileName);
 
@@ -54,8 +63,10 @@ namespace SimHub.Plugin.Voicemeeter
         [DllImport(DllName, CharSet = CharSet.Ansi)]
         private static extern int VBVMR_SetParameters(string script);
 
+        // Wide-char variant: labels are user-entered text that can contain non-ASCII characters,
+        // which the ...StringA variant would mangle. Buffer is 512 UTF-16 code units per the API docs.
         [DllImport(DllName, CharSet = CharSet.Ansi)]
-        private static extern int VBVMR_GetParameterStringA(string paramName, [MarshalAs(UnmanagedType.LPArray)] byte[] value);
+        private static extern int VBVMR_GetParameterStringW(string paramName, [MarshalAs(UnmanagedType.LPArray)] byte[] value);
 
         /// <summary>
         /// Guards every call into VoicemeeterRemote.dll and all state below. SimHub invokes button/
@@ -79,6 +90,8 @@ namespace SimHub.Plugin.Voicemeeter
         /// </summary>
         private readonly Dictionary<string, float> _lastCommandedValue = new Dictionary<string, float>();
 
+        private static readonly ChannelKind[] ChannelKinds = { ChannelKind.Strip, ChannelKind.Bus };
+
         public bool IsConnected { get; private set; }
 
         public VoicemeeterType Type { get; private set; } = VoicemeeterType.Unknown;
@@ -92,6 +105,8 @@ namespace SimHub.Plugin.Voicemeeter
         /// Number of output buses (hardware + virtual) exposed by the running Voicemeeter edition.
         /// </summary>
         public int BusCount { get; private set; }
+
+        public int GetChannelCount(ChannelKind kind) => kind == ChannelKind.Strip ? StripCount : BusCount;
 
         /// <summary>
         /// Attempts to (re)connect to a running Voicemeeter instance. Safe to call repeatedly, e.g. every
@@ -159,11 +174,7 @@ namespace SimHub.Plugin.Voicemeeter
         {
             lock (_syncRoot)
             {
-                IsConnected = false;
-                Type = VoicemeeterType.Unknown;
-                StripCount = 0;
-                BusCount = 0;
-                _lastCommandedValue.Clear();
+                MarkDisconnectedLocked();
             }
         }
 
@@ -210,26 +221,22 @@ namespace SimHub.Plugin.Voicemeeter
 
         private void RefreshCacheFromDevice()
         {
-            for (int i = 0; i < StripCount && IsConnected; i++)
+            foreach (ChannelKind kind in ChannelKinds)
             {
-                _lastCommandedValue[$"Strip[{i}].Gain"] = GetFloat($"Strip[{i}].Gain");
-                if (!IsConnected)
+                int count = GetChannelCount(kind);
+                for (int i = 0; i < count && IsConnected; i++)
                 {
-                    return;
+                    RefreshCacheEntry(ParamName(kind, i, "Gain"));
+                    RefreshCacheEntry(ParamName(kind, i, "Mute"));
                 }
-
-                _lastCommandedValue[$"Strip[{i}].Mute"] = GetFloat($"Strip[{i}].Mute");
             }
+        }
 
-            for (int i = 0; i < BusCount && IsConnected; i++)
+        private void RefreshCacheEntry(string paramName)
+        {
+            if (IsConnected && TryGetFloat(paramName, out float value))
             {
-                _lastCommandedValue[$"Bus[{i}].Gain"] = GetFloat($"Bus[{i}].Gain");
-                if (!IsConnected)
-                {
-                    return;
-                }
-
-                _lastCommandedValue[$"Bus[{i}].Mute"] = GetFloat($"Bus[{i}].Mute");
+                _lastCommandedValue[paramName] = value;
             }
         }
 
@@ -243,94 +250,40 @@ namespace SimHub.Plugin.Voicemeeter
 
         private static float ClampGain(float dbValue) => Math.Max(MinGainDb, Math.Min(MaxGainDb, dbValue));
 
-        public float GetStripGain(int index)
+        // ChannelKind's enum names ("Strip"/"Bus") deliberately match the Remote API's parameter
+        // prefixes, so the native parameter name can be built directly from the enum.
+        private static string ParamName(ChannelKind kind, int index, string suffix) => $"{kind}[{index}].{suffix}";
+
+        public float GetGain(ChannelKind kind, int index)
         {
             lock (_syncRoot)
             {
-                return GetLastCommandedOrFetch($"Strip[{index}].Gain");
+                return GetLastCommandedOrFetch(ParamName(kind, index, "Gain"));
             }
         }
 
-        public void SetStripGain(int index, float dbValue)
+        public void SetGain(ChannelKind kind, int index, float dbValue)
         {
             lock (_syncRoot)
             {
-                SetFloat($"Strip[{index}].Gain", ClampGain(dbValue));
+                SetFloat(ParamName(kind, index, "Gain"), ClampGain(dbValue));
             }
         }
 
-        public bool GetStripMute(int index)
+        public bool GetMute(ChannelKind kind, int index)
         {
             lock (_syncRoot)
             {
-                return GetLastCommandedOrFetch($"Strip[{index}].Mute") >= 0.5f;
+                return GetLastCommandedOrFetch(ParamName(kind, index, "Mute")) >= 0.5f;
             }
         }
 
-        public void SetStripMute(int index, bool mute)
+        public void SetMute(ChannelKind kind, int index, bool mute)
         {
             lock (_syncRoot)
             {
-                SetFloat($"Strip[{index}].Mute", mute ? 1f : 0f);
+                SetFloat(ParamName(kind, index, "Mute"), mute ? 1f : 0f);
             }
-        }
-
-        public float GetBusGain(int index)
-        {
-            lock (_syncRoot)
-            {
-                return GetLastCommandedOrFetch($"Bus[{index}].Gain");
-            }
-        }
-
-        public void SetBusGain(int index, float dbValue)
-        {
-            lock (_syncRoot)
-            {
-                SetFloat($"Bus[{index}].Gain", ClampGain(dbValue));
-            }
-        }
-
-        public bool GetBusMute(int index)
-        {
-            lock (_syncRoot)
-            {
-                return GetLastCommandedOrFetch($"Bus[{index}].Mute") >= 0.5f;
-            }
-        }
-
-        public void SetBusMute(int index, bool mute)
-        {
-            lock (_syncRoot)
-            {
-                SetFloat($"Bus[{index}].Mute", mute ? 1f : 0f);
-            }
-        }
-
-        // Always leads with the same "Strip{index}"/"Bus{index}" naming used for the SimHub action and
-        // property names (e.g. "GainUpBus0"), so a row shown here can always be matched back to the
-        // target you'd pick in SimHub's Controls and events mapping screen - Voicemeeter's own custom
-        // label (if the user set one) is appended rather than substituted, so renaming a bus/strip
-        // inside Voicemeeter can never break that correlation.
-        public string GetStripLabel(int index)
-        {
-            lock (_syncRoot)
-            {
-                return CombineWithTechnicalName($"Strip{index}", GetStringOrDefault($"Strip[{index}].Label", null));
-            }
-        }
-
-        public string GetBusLabel(int index)
-        {
-            lock (_syncRoot)
-            {
-                return CombineWithTechnicalName($"Bus{index}", GetStringOrDefault($"Bus[{index}].Label", null));
-            }
-        }
-
-        private static string CombineWithTechnicalName(string technicalName, string customLabel)
-        {
-            return string.IsNullOrEmpty(customLabel) ? technicalName : $"{technicalName} ({customLabel})";
         }
 
         /// <summary>
@@ -338,55 +291,45 @@ namespace SimHub.Plugin.Voicemeeter
         /// the first time, before anything has been commanded yet). See the remarks on
         /// <see cref="_lastCommandedValue"/> for why this must not re-read the live value on every call.
         /// </summary>
-        public void ToggleStripMute(int index)
+        public void ToggleMute(ChannelKind kind, int index)
         {
             lock (_syncRoot)
             {
-                ToggleMute($"Strip[{index}].Mute");
-            }
-        }
-
-        public void ToggleBusMute(int index)
-        {
-            lock (_syncRoot)
-            {
-                ToggleMute($"Bus[{index}].Mute");
+                string paramName = ParamName(kind, index, "Mute");
+                bool current = GetLastCommandedOrFetch(paramName) >= 0.5f;
+                SetFloat(paramName, current ? 0f : 1f);
             }
         }
 
         /// <summary>
         /// Applies a relative gain step on top of the last value *we* commanded, for the same reason
-        /// as <see cref="ToggleStripMute"/>.
+        /// as <see cref="ToggleMute"/>.
         /// </summary>
-        public void AdjustStripGain(int index, float deltaDb)
+        public void AdjustGain(ChannelKind kind, int index, float deltaDb)
         {
             lock (_syncRoot)
             {
-                AdjustGain($"Strip[{index}].Gain", deltaDb);
+                string paramName = ParamName(kind, index, "Gain");
+                SetFloat(paramName, ClampGain(GetLastCommandedOrFetch(paramName) + deltaDb));
             }
         }
 
-        public void AdjustBusGain(int index, float deltaDb)
+        // Always leads with the same "Strip{index}"/"Bus{index}" naming used for the SimHub action and
+        // property names, so a row shown on the settings screen can always be matched back to the
+        // target you'd pick in SimHub's Controls and events mapping screen - Voicemeeter's own custom
+        // label (if the user set one) is appended rather than substituted, so renaming a bus/strip
+        // inside Voicemeeter can never break that correlation.
+        public string GetLabel(ChannelKind kind, int index)
         {
             lock (_syncRoot)
             {
-                AdjustGain($"Bus[{index}].Gain", deltaDb);
+                string technicalName = $"{kind}{index}";
+                string customLabel = GetStringOrDefault(ParamName(kind, index, "Label"), null);
+                return string.IsNullOrEmpty(customLabel) ? technicalName : $"{technicalName} ({customLabel})";
             }
         }
 
         // Everything below this point must only ever be called while already holding _syncRoot.
-
-        private void ToggleMute(string paramName)
-        {
-            bool current = GetLastCommandedOrFetch(paramName) >= 0.5f;
-            SetFloat(paramName, current ? 0f : 1f);
-        }
-
-        private void AdjustGain(string paramName, float deltaDb)
-        {
-            float current = GetLastCommandedOrFetch(paramName);
-            SetFloat(paramName, ClampGain(current + deltaDb));
-        }
 
         private float GetLastCommandedOrFetch(string paramName)
         {
@@ -405,38 +348,40 @@ namespace SimHub.Plugin.Voicemeeter
             }
             catch (Exception)
             {
-                // Ignored here - the GetFloat call right below will detect and report any real failure.
+                // Ignored here - the fetch right below will detect and report any real failure.
             }
 
-            float fetched = GetFloat(paramName);
-            if (IsConnected)
+            if (TryGetFloat(paramName, out float fetched))
             {
-                // GetFloat marks us disconnected (and clears the cache) on failure, in which case
-                // caching this fallback 0 would just re-poison the cache we were just cleared of.
                 _lastCommandedValue[paramName] = fetched;
+                return fetched;
             }
 
-            return fetched;
+            return 0f;
         }
 
-        private float GetFloat(string paramName)
+        private bool TryGetFloat(string paramName, out float value)
         {
+            value = 0f;
             try
             {
-                float value = 0f;
                 int result = VBVMR_GetParameterFloat(paramName, ref value);
-                if (result != 0)
+                if (result == 0)
                 {
-                    MarkDisconnectedLocked();
-                    return 0f;
+                    return true;
                 }
 
-                return value;
+                if (result == ResultNoServer)
+                {
+                    MarkDisconnectedLocked();
+                }
+
+                return false;
             }
             catch (Exception)
             {
                 MarkDisconnectedLocked();
-                return 0f;
+                return false;
             }
         }
 
@@ -445,13 +390,16 @@ namespace SimHub.Plugin.Voicemeeter
             try
             {
                 int result = VBVMR_SetParameterFloat(paramName, value);
-                if (result != 0)
+                if (result == 0)
                 {
-                    MarkDisconnectedLocked();
+                    _lastCommandedValue[paramName] = value;
                     return;
                 }
 
-                _lastCommandedValue[paramName] = value;
+                if (result == ResultNoServer)
+                {
+                    MarkDisconnectedLocked();
+                }
             }
             catch (Exception)
             {
@@ -463,14 +411,22 @@ namespace SimHub.Plugin.Voicemeeter
         {
             try
             {
-                byte[] buffer = new byte[512];
-                int result = VBVMR_GetParameterStringA(paramName, buffer);
+                // 512 UTF-16 code units, the buffer size the Remote API documents for string parameters.
+                byte[] buffer = new byte[1024];
+                int result = VBVMR_GetParameterStringW(paramName, buffer);
                 if (result != 0)
                 {
                     return fallback;
                 }
 
-                string value = Encoding.ASCII.GetString(buffer).TrimEnd('\0').Trim();
+                string value = Encoding.Unicode.GetString(buffer);
+                int terminator = value.IndexOf('\0');
+                if (terminator >= 0)
+                {
+                    value = value.Substring(0, terminator);
+                }
+
+                value = value.Trim();
                 return string.IsNullOrEmpty(value) ? fallback : value;
             }
             catch (Exception)
@@ -479,12 +435,6 @@ namespace SimHub.Plugin.Voicemeeter
             }
         }
 
-        /// <summary>
-        /// Same as <see cref="MarkDisconnected"/> but for use by code that already holds
-        /// <see cref="_syncRoot"/> (Monitor/lock is reentrant on the same thread, so this could just
-        /// call MarkDisconnected directly, but naming it separately makes the locking contract at each
-        /// call site explicit).
-        /// </summary>
         private void MarkDisconnectedLocked()
         {
             IsConnected = false;
@@ -497,7 +447,10 @@ namespace SimHub.Plugin.Voicemeeter
         /// <summary>
         /// Loads VoicemeeterRemote.dll from its resolved install directory so the plain
         /// DllImport("VoicemeeterRemote.dll") calls above can find it even though that
-        /// directory is not on PATH.
+        /// directory is not on PATH. Only latches once the DLL is actually resident, so a
+        /// missing/failed install keeps being retried on later connect attempts instead of being
+        /// disabled for the rest of the process lifetime (e.g. Voicemeeter installed after SimHub
+        /// started).
         /// </summary>
         private static void EnsureNativeLibraryLoaded()
         {
@@ -506,8 +459,6 @@ namespace SimHub.Plugin.Voicemeeter
                 return;
             }
 
-            _nativeLibraryPrepared = true;
-
             string installDir = FindVoicemeeterInstallDir();
             if (installDir == null)
             {
@@ -515,9 +466,9 @@ namespace SimHub.Plugin.Voicemeeter
             }
 
             string fullPath = Path.Combine(installDir, DllName);
-            if (File.Exists(fullPath))
+            if (File.Exists(fullPath) && LoadLibrary(fullPath) != IntPtr.Zero)
             {
-                LoadLibrary(fullPath);
+                _nativeLibraryPrepared = true;
             }
         }
 

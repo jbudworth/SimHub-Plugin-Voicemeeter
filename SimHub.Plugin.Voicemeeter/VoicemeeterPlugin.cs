@@ -12,9 +12,10 @@ namespace SimHub.Plugin.Voicemeeter
     {
         /// <summary>
         /// Display-only property count (Gain/Mute/Label per channel, for dashboards) is fixed for the
-        /// plugin's lifetime, so we register the maximum channel set a Potato edition can have.
-        /// Editions with fewer channels simply leave the upper indexes at their default (0 dB /
-        /// unmuted) with no effect. Actions are no longer tied to this maximum - see the user-defined
+        /// plugin's lifetime, so we register the maximum channel set a Potato edition can have. Each
+        /// delegate guards on the *connected* edition's real channel count before touching the native
+        /// API, so on smaller editions the upper indexes just report defaults instead of issuing
+        /// unknown-parameter requests. Actions are not tied to this maximum - see the user-defined
         /// preset list in Settings, which registers exactly one action per preset the user created.
         /// </summary>
         public const int MaxStrips = 8;
@@ -42,20 +43,16 @@ namespace SimHub.Plugin.Voicemeeter
             this.AttachDelegate("Connected", () => Remote.IsConnected);
             this.AttachDelegate("Type", () => Remote.Type.ToString());
 
-            for (int i = 0; i < MaxStrips; i++)
+            foreach (ChannelKind kind in new[] { ChannelKind.Strip, ChannelKind.Bus })
             {
-                int index = i;
-                this.AttachDelegate($"Strip{index}.Gain", () => Remote.IsConnected ? (double)Remote.GetStripGain(index) : 0d);
-                this.AttachDelegate($"Strip{index}.Mute", () => Remote.IsConnected && Remote.GetStripMute(index));
-                this.AttachDelegate($"Strip{index}.Label", () => Remote.IsConnected ? Remote.GetStripLabel(index) : string.Empty);
-            }
-
-            for (int i = 0; i < MaxBuses; i++)
-            {
-                int index = i;
-                this.AttachDelegate($"Bus{index}.Gain", () => Remote.IsConnected ? (double)Remote.GetBusGain(index) : 0d);
-                this.AttachDelegate($"Bus{index}.Mute", () => Remote.IsConnected && Remote.GetBusMute(index));
-                this.AttachDelegate($"Bus{index}.Label", () => Remote.IsConnected ? Remote.GetBusLabel(index) : string.Empty);
+                int max = kind == ChannelKind.Strip ? MaxStrips : MaxBuses;
+                for (int i = 0; i < max; i++)
+                {
+                    int index = i;
+                    this.AttachDelegate($"{kind}{index}.Gain", () => IsChannelAvailable(kind, index) ? (double)Remote.GetGain(kind, index) : 0d);
+                    this.AttachDelegate($"{kind}{index}.Mute", () => IsChannelAvailable(kind, index) && Remote.GetMute(kind, index));
+                    this.AttachDelegate($"{kind}{index}.Label", () => IsChannelAvailable(kind, index) ? Remote.GetLabel(kind, index) : string.Empty);
+                }
             }
 
             // One action per user-defined preset - the count here is exactly what the user configured,
@@ -70,102 +67,72 @@ namespace SimHub.Plugin.Voicemeeter
             TryReconnect();
         }
 
+        private bool IsChannelAvailable(ChannelKind kind, int index)
+        {
+            return Remote.IsConnected && index < Remote.GetChannelCount(kind);
+        }
+
         /// <summary>
         /// Applies a single preset's function to its channel. Called both by the registered SimHub
         /// action and by the settings screen's "Test fire" button, so both paths behave identically.
         /// </summary>
         internal void ApplyPreset(ChannelPreset preset)
         {
+            if (preset.ChannelIndex >= Remote.GetChannelCount(preset.Channel))
+            {
+                // Also covers the disconnected state (counts are 0). A preset can legitimately target
+                // a channel the current edition lacks if it was created while a bigger edition (e.g.
+                // Potato) was running - ignore it rather than sending a request for a channel that
+                // doesn't exist, which Voicemeeter rejects.
+                SimHub.Logging.Current.Warn($"[Voicemeeter] Preset '{preset.DisplayName}' targets {preset.ChannelLabel}, which is not available on the connected Voicemeeter edition - ignored.");
+                return;
+            }
+
             switch (preset.Function)
             {
                 case PresetFunction.GainSet:
-                    if (preset.Channel == ChannelKind.Strip)
-                    {
-                        Remote.SetStripGain(preset.ChannelIndex, preset.Value);
-                    }
-                    else
-                    {
-                        Remote.SetBusGain(preset.ChannelIndex, preset.Value);
-                    }
-
+                    Remote.SetGain(preset.Channel, preset.ChannelIndex, preset.Value);
                     break;
-
                 case PresetFunction.GainStep:
-                    if (preset.Channel == ChannelKind.Strip)
-                    {
-                        Remote.AdjustStripGain(preset.ChannelIndex, preset.Value);
-                    }
-                    else
-                    {
-                        Remote.AdjustBusGain(preset.ChannelIndex, preset.Value);
-                    }
-
+                    Remote.AdjustGain(preset.Channel, preset.ChannelIndex, preset.Value);
                     break;
-
                 case PresetFunction.MuteOn:
-                    if (preset.Channel == ChannelKind.Strip)
-                    {
-                        Remote.SetStripMute(preset.ChannelIndex, true);
-                    }
-                    else
-                    {
-                        Remote.SetBusMute(preset.ChannelIndex, true);
-                    }
-
+                    Remote.SetMute(preset.Channel, preset.ChannelIndex, true);
                     break;
-
                 case PresetFunction.MuteOff:
-                    if (preset.Channel == ChannelKind.Strip)
-                    {
-                        Remote.SetStripMute(preset.ChannelIndex, false);
-                    }
-                    else
-                    {
-                        Remote.SetBusMute(preset.ChannelIndex, false);
-                    }
-
+                    Remote.SetMute(preset.Channel, preset.ChannelIndex, false);
                     break;
-
                 case PresetFunction.MuteToggle:
-                    if (preset.Channel == ChannelKind.Strip)
-                    {
-                        Remote.ToggleStripMute(preset.ChannelIndex);
-                    }
-                    else
-                    {
-                        Remote.ToggleBusMute(preset.ChannelIndex);
-                    }
-
+                    Remote.ToggleMute(preset.Channel, preset.ChannelIndex);
                     break;
             }
         }
 
         /// <summary>
         /// Adds a new preset and persists it immediately, so it survives even if the user restarts
-        /// SimHub without pressing "Save settings" first - restarting is already required before the
-        /// preset's action shows up in Controls and Events, so losing it to a forgotten save on top of
-        /// that would be a bad surprise. Returns null if an identical preset (same channel, function
-        /// and value) already exists - since the action name is now the human-readable display text
-        /// rather than an opaque id, two identical presets would otherwise collide on the same name.
+        /// SimHub without an explicit save - restarting is already required before the preset's action
+        /// shows up in Controls and Events, so losing it on top of that would be a bad surprise.
+        /// Returns null if a preset with the same action name already exists: SimHub actions are keyed
+        /// by name, and the name rounds gain to one decimal, so e.g. values 5.01 and 5.04 are distinct
+        /// floats that would both register as "Strip0 Gain 5.0dB" - deduping on the generated name
+        /// (rather than raw component equality) is what actually prevents the collision.
         /// </summary>
         internal ChannelPreset AddPreset(ChannelKind channel, int channelIndex, PresetFunction function, float value)
         {
-            bool isDuplicate = Settings.Presets.Exists(p =>
-                p.Channel == channel && p.ChannelIndex == channelIndex && p.Function == function && p.Value == value);
-            if (isDuplicate)
-            {
-                return null;
-            }
-
             var preset = new ChannelPreset
             {
-                Id = Settings.NextPresetId++,
                 Channel = channel,
                 ChannelIndex = channelIndex,
                 Function = function,
                 Value = value
             };
 
+            if (Settings.Presets.Exists(p => p.ActionName == preset.ActionName))
+            {
+                return null;
+            }
+
+            preset.Id = Settings.NextPresetId++;
             Settings.Presets.Add(preset);
             this.SaveCommonSettings("GeneralSettings", Settings);
             return preset;
