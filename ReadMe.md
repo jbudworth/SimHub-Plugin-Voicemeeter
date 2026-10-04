@@ -5,6 +5,8 @@ A [SimHub](https://www.simhubdash.com/) plugin that lets you control
 directly from SimHub: gain and mute for every input strip and output bus,
 plus a live settings screen showing the current values.
 
+![Settings](imgs/VoiceMeeter_Settings.png)
+
 Talks to Voicemeeter via the official Voicemeeter Remote API
 (`VoicemeeterRemote.dll`, the 32-bit build - SimHub itself runs as a 32-bit
 process), so Voicemeeter itself must be installed on the same machine. The
